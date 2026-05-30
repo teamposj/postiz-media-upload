@@ -37,7 +37,7 @@ function extractDriveId(input) {
 
 function toDownloadUrl(input) {
   const driveId = extractDriveId(input);
-  if (driveId) return `https://drive.google.com/uc?export=download&id=${driveId}`;
+  if (driveId) return `https://drive.usercontent.google.com/download?id=${driveId}&export=download`;
   return input;
 }
 
