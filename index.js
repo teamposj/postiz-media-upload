@@ -12,6 +12,11 @@ import { z } from "zod";
 const POSTIZ_BASE_URL = process.env.POSTIZ_BASE_URL;
 const POSTIZ_API_KEY  = process.env.POSTIZ_API_KEY;
 const PORT            = parseInt(process.env.PORT || "3000", 10);
+const MCP_ACCESS_KEY  = process.env.MCP_ACCESS_KEY;
+const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN;
+const IG_ACCOUNTS     = JSON.parse(process.env.IG_ACCOUNTS || "{}");
+const IG_ACCOUNT_NAMES = Object.keys(IG_ACCOUNTS);
+const GRAPH_URL       = `https://graph.facebook.com/${process.env.GRAPH_VERSION || "v26.0"}`;
 
 if (!POSTIZ_BASE_URL || !POSTIZ_API_KEY) {
   console.error("❌ Missing env vars: POSTIZ_BASE_URL and POSTIZ_API_KEY are required.");
@@ -85,6 +90,40 @@ async function downloadAndUploadToPostiz(sourceUrl, fileType = "jpg") {
   return data;
 }
 
+// ─── Instagram Graph API ──────────────────────────────────────────────────────
+
+function getIgAccount(name) {
+  const account = IG_ACCOUNTS[name];
+  if (!account) throw new Error(`Unknown Instagram account "${name}". Configured: ${IG_ACCOUNT_NAMES.join(", ") || "none"}`);
+  if (!IG_ACCESS_TOKEN) throw new Error("IG_ACCESS_TOKEN is not set.");
+  return account;
+}
+
+async function graph(method, path, params = {}) {
+  const query = new URLSearchParams({ ...params, access_token: IG_ACCESS_TOKEN });
+  const url = method === "GET" ? `${GRAPH_URL}${path}?${query}` : `${GRAPH_URL}${path}`;
+  const resp = await fetch(url, method === "GET" ? {} : { method, body: query });
+  const data = await resp.json();
+  if (data.error) throw new Error(`Instagram API: ${data.error.message}`);
+  return data;
+}
+
+/** Instagram processes reels asynchronously and rejects media_publish until the container is FINISHED. */
+async function waitForContainer(containerId, timeoutMs = 10 * 60 * 1000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const { status_code, status } = await graph("GET", `/${containerId}`, { fields: "status_code,status" });
+    if (status_code === "FINISHED") return;
+    if (status_code === "ERROR" || status_code === "EXPIRED") throw new Error(`Reel processing failed: ${status}`);
+    await new Promise((r) => setTimeout(r, 10000));
+  }
+  throw new Error("Timed out waiting for Instagram to process the reel.");
+}
+
+function jsonResult(payload, isError = false) {
+  return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }], ...(isError && { isError }) };
+}
+
 // ─── MCP Server Factory ───────────────────────────────────────────────────────
 function buildMcpServer() {
   const server = new McpServer({ name: "postiz-media-mcp", version: "1.0.0" });
@@ -152,6 +191,78 @@ function buildMcpServer() {
     }
   );
 
+  const accountParam = z.string().default(IG_ACCOUNT_NAMES[0] || "thedrapingqueen")
+    .describe(`Instagram account. Configured: ${IG_ACCOUNT_NAMES.join(", ") || "none"}`);
+
+  server.tool(
+    "instagram_check_shopping",
+    "Check whether an Instagram account can tag products and list its catalogs.",
+    { account: accountParam },
+    async ({ account }) => {
+      try {
+        const { ig_user_id } = getIgAccount(account);
+        const profile = await graph("GET", `/${ig_user_id}`, { fields: "username,shopping_product_tag_eligibility" });
+        const catalogs = await graph("GET", `/${ig_user_id}/available_catalogs`);
+        return jsonResult({ profile, catalogs: catalogs.data });
+      } catch (err) {
+        return jsonResult({ success: false, error: err.message }, true);
+      }
+    }
+  );
+
+  server.tool(
+    "instagram_search_products",
+    "Search an Instagram Shop catalog by product name or SKU. Returns only approved products (tags for unapproved products never appear on posts). Pass the product_id values to instagram_publish_reel_with_products.",
+    {
+      account: accountParam,
+      query: z.string().describe("Product name or SKU, e.g. 'baroque swag'"),
+    },
+    async ({ account, query }) => {
+      try {
+        const { ig_user_id, catalog_id } = getIgAccount(account);
+        const result = await graph("GET", `/${ig_user_id}/catalog_product_search`, { catalog_id, q: query });
+        const products = result.data
+          .filter((p) => p.review_status === "approved")
+          .map((p) => ({ product_id: String(p.product_id), name: p.product_name, image_url: p.image_url }));
+        return jsonResult({ count: products.length, products });
+      } catch (err) {
+        return jsonResult({ success: false, error: err.message }, true);
+      }
+    }
+  );
+
+  server.tool(
+    "instagram_publish_reel_with_products",
+    "Publish a Reel directly to Instagram with product tags and an optional custom cover image. Publishes IMMEDIATELY (no scheduling) and does not appear in Postiz. Instagram allows at most 25 product-tagged posts per account per 24h.",
+    {
+      account: accountParam,
+      video_url: z.string().describe("Public .mp4 URL, e.g. a Postiz /uploads/ path from postiz_upload_from_url"),
+      caption: z.string().max(2200).describe("Plain-text caption (not HTML)"),
+      product_ids: z.array(z.string()).min(1).max(5).describe("product_id values from instagram_search_products"),
+      cover_url: z.string().optional().describe("Public JPG/PNG cover image URL, ideally 1080x1920"),
+      share_to_feed: z.boolean().default(true),
+    },
+    async ({ account, video_url, caption, product_ids, cover_url, share_to_feed = true }) => {
+      try {
+        const { ig_user_id } = getIgAccount(account);
+        const container = await graph("POST", `/${ig_user_id}/media`, {
+          media_type: "REELS",
+          video_url,
+          caption,
+          share_to_feed: String(share_to_feed),
+          product_tags: JSON.stringify(product_ids.map((product_id) => ({ product_id }))),
+          ...(cover_url && { cover_url }),
+        });
+        await waitForContainer(container.id);
+        const published = await graph("POST", `/${ig_user_id}/media_publish`, { creation_id: container.id });
+        const media = await graph("GET", `/${published.id}`, { fields: "permalink" });
+        return jsonResult({ success: true, account, media_id: published.id, permalink: media.permalink });
+      } catch (err) {
+        return jsonResult({ success: false, error: err.message }, true);
+      }
+    }
+  );
+
   return server;
 }
 
@@ -168,6 +279,14 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_, res) => res.json({ status: "ok", service: "postiz-media-mcp" }));
+
+function requireAccessKey(req, res, next) {
+  if (!MCP_ACCESS_KEY) return next();
+  const bearer = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  if (req.query.key === MCP_ACCESS_KEY || bearer === MCP_ACCESS_KEY) return next();
+  res.status(401).json({ error: "Unauthorized" });
+}
+app.use(["/mcp", "/sse"], requireAccessKey);
 
 // ─── Streamable HTTP ──────────────────────────────────────────────────────────
 const httpSessions = new Map();
