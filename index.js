@@ -103,9 +103,38 @@ async function graph(method, path, params = {}) {
   const query = new URLSearchParams({ ...params, access_token: IG_ACCESS_TOKEN });
   const url = method === "GET" ? `${GRAPH_URL}${path}?${query}` : `${GRAPH_URL}${path}`;
   const resp = await fetch(url, method === "GET" ? {} : { method, body: query });
-  const data = await resp.json();
-  if (data.error) throw new Error(`Instagram API: ${data.error.message}`);
+  // Product and media IDs exceed Number.MAX_SAFE_INTEGER; quote bare long integers so they survive JSON.parse intact.
+  const data = JSON.parse((await resp.text()).replace(/(:\s*)(\d{16,})(?=\s*[,}\]])/g, '$1"$2"'));
+  if (data.error) {
+    const { message, error_user_title, error_user_msg, code, error_subcode } = data.error;
+    const detail = [error_user_title, error_user_msg].filter(Boolean).join(": ");
+    throw new Error(`Instagram API: ${message}${detail ? ` (${detail})` : ""} [code ${code}${error_subcode ? `/${error_subcode}` : ""}]`);
+  }
   return data;
+}
+
+/**
+ * Tags products on an already-published reel. Tagging inside the media container is rejected for
+ * website-checkout shops (error 2207125 "Merchant ineligible for product tagging"), which since
+ * Meta removed native checkout in 2025 is every shop, but tagging published media still works.
+ */
+async function tagPublishedMedia(mediaId, productIds) {
+  const updated_tags = JSON.stringify(productIds.map((product_id) => ({ product_id })));
+  await graph("POST", `/${mediaId}/product_tags`, { updated_tags });
+  const tags = await graph("GET", `/${mediaId}/product_tags`);
+  return tags.data.map((t) => ({ product_id: String(t.product_id), name: t.name, review_status: t.review_status }));
+}
+
+const REEL_URL_PATTERN = /instagram\.com\/(?:reel|reels|p)\/([A-Za-z0-9_-]+)/;
+
+/** Accepts a media ID or an instagram.com reel/post URL; URLs are matched against the account's recent media. */
+async function resolveMediaId(igUserId, reel) {
+  const shortcode = reel.match(REEL_URL_PATTERN)?.[1];
+  if (!shortcode) return reel.trim();
+  const media = await graph("GET", `/${igUserId}/media`, { fields: "id,permalink", limit: "100" });
+  const match = media.data.find((m) => m.permalink?.includes(`/${shortcode}/`));
+  if (!match) throw new Error(`Couldn't find ${reel} among the account's 100 most recent posts. Pass its media ID instead.`);
+  return match.id;
 }
 
 /** Instagram processes reels asynchronously and rejects media_publish until the container is FINISHED. */
@@ -212,7 +241,7 @@ function buildMcpServer() {
 
   server.tool(
     "instagram_search_products",
-    "Search an Instagram Shop catalog by product name or SKU. Returns only approved products (tags for unapproved products never appear on posts). Pass the product_id values to instagram_publish_reel_with_products.",
+    "Search an Instagram Shop catalog by product name or SKU. Returns only approved products (tags for unapproved products never appear on posts), each with its color/size variants. Tag a specific variant's product_id when the reel shows a specific color or size. Pass the product_id values to instagram_publish_reel_with_products or instagram_tag_existing_reel.",
     {
       account: accountParam,
       query: z.string().describe("Product name or SKU, e.g. 'baroque swag'"),
@@ -223,7 +252,12 @@ function buildMcpServer() {
         const result = await graph("GET", `/${ig_user_id}/catalog_product_search`, { catalog_id, q: query });
         const products = result.data
           .filter((p) => p.review_status === "approved")
-          .map((p) => ({ product_id: String(p.product_id), name: p.product_name, image_url: p.image_url }));
+          .map((p) => ({
+            product_id: String(p.product_id),
+            name: p.product_name,
+            image_url: p.image_url,
+            variants: (p.product_variants || []).map((v) => ({ product_id: String(v.product_id), variant: v.variant_name })),
+          }));
         return jsonResult({ count: products.length, products });
       } catch (err) {
         return jsonResult({ success: false, error: err.message }, true);
@@ -233,7 +267,7 @@ function buildMcpServer() {
 
   server.tool(
     "instagram_publish_reel_with_products",
-    "Publish a Reel directly to Instagram with product tags and an optional custom cover image. Publishes IMMEDIATELY (no scheduling) and does not appear in Postiz. Instagram allows at most 25 product-tagged posts per account per 24h.",
+    "Publish a Reel directly to Instagram, then tag products on it, with an optional custom cover image. Publishes IMMEDIATELY (no scheduling) and does not appear in Postiz. If tagging fails the reel stays published and the result says which products to tag in the Instagram app. Instagram allows at most 25 product-tagged posts per account per 24h.",
     {
       account: accountParam,
       video_url: z.string().describe("Public .mp4 URL, e.g. a Postiz /uploads/ path from postiz_upload_from_url"),
@@ -250,13 +284,74 @@ function buildMcpServer() {
           video_url,
           caption,
           share_to_feed: String(share_to_feed),
-          product_tags: JSON.stringify(product_ids.map((product_id) => ({ product_id }))),
           ...(cover_url && { cover_url }),
         });
         await waitForContainer(container.id);
         const published = await graph("POST", `/${ig_user_id}/media_publish`, { creation_id: container.id });
         const media = await graph("GET", `/${published.id}`, { fields: "permalink" });
-        return jsonResult({ success: true, account, media_id: published.id, permalink: media.permalink });
+        try {
+          const tags = await tagPublishedMedia(published.id, product_ids);
+          return jsonResult({ success: true, account, media_id: published.id, permalink: media.permalink, tags });
+        } catch (tagErr) {
+          return jsonResult({
+            success: true,
+            published: true,
+            tagged: false,
+            account,
+            media_id: published.id,
+            permalink: media.permalink,
+            tagging_error: tagErr.message,
+            action_needed: `Reel is live but untagged. Retry with instagram_tag_existing_reel, or tag product IDs ${product_ids.join(", ")} in the Instagram app (Edit → Tag products).`,
+          });
+        }
+      } catch (err) {
+        return jsonResult({ success: false, error: err.message }, true);
+      }
+    }
+  );
+
+  server.tool(
+    "instagram_list_recent_reels",
+    "List an Instagram account's most recent posts (reels and feed) with media ID, caption, link and any product tags, to find a reel to tag.",
+    {
+      account: accountParam,
+      limit: z.number().int().min(1).max(50).default(10),
+    },
+    async ({ account, limit = 10 }) => {
+      try {
+        const { ig_user_id } = getIgAccount(account);
+        const media = await graph("GET", `/${ig_user_id}/media`, {
+          fields: "id,caption,media_product_type,permalink,timestamp",
+          limit: String(limit),
+        });
+        const posts = media.data.map((m) => ({
+          media_id: m.id,
+          type: m.media_product_type,
+          posted: m.timestamp,
+          permalink: m.permalink,
+          caption: (m.caption || "").slice(0, 160),
+        }));
+        return jsonResult({ count: posts.length, posts });
+      } catch (err) {
+        return jsonResult({ success: false, error: err.message }, true);
+      }
+    }
+  );
+
+  server.tool(
+    "instagram_tag_existing_reel",
+    "Add product tags to a reel or post that is already published. Tags are added alongside any existing tags. Accepts a media ID or an instagram.com reel URL.",
+    {
+      account: accountParam,
+      reel: z.string().describe("Media ID or instagram.com/reel/... URL"),
+      product_ids: z.array(z.string()).min(1).max(5).describe("product_id values from instagram_search_products"),
+    },
+    async ({ account, reel, product_ids }) => {
+      try {
+        const { ig_user_id } = getIgAccount(account);
+        const mediaId = await resolveMediaId(ig_user_id, reel);
+        const tags = await tagPublishedMedia(mediaId, product_ids);
+        return jsonResult({ success: true, account, media_id: mediaId, tags });
       } catch (err) {
         return jsonResult({ success: false, error: err.message }, true);
       }
