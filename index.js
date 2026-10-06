@@ -241,7 +241,7 @@ function buildMcpServer() {
 
   server.tool(
     "instagram_search_products",
-    "Search an Instagram Shop catalog by product name or SKU. Returns only approved products (tags for unapproved products never appear on posts), each with its color/size variants. Tag a specific variant's product_id when the reel shows a specific color or size. Pass the product_id values to instagram_publish_reel_with_products or instagram_tag_existing_reel.",
+    "Search an Instagram Shop catalog by product name or SKU. Returns only approved products (tags for unapproved products never appear on posts), each with its color/size variants. Tag a specific variant's product_id when the reel shows a specific color or size. Pass the product_id values to instagram_publish_reel or instagram_tag_existing_reel.",
     {
       account: accountParam,
       query: z.string().describe("Product name or SKU, e.g. 'baroque swag'"),
@@ -266,17 +266,17 @@ function buildMcpServer() {
   );
 
   server.tool(
-    "instagram_publish_reel_with_products",
-    "Publish a Reel directly to Instagram, then tag products on it, with an optional custom cover image. Publishes IMMEDIATELY (no scheduling) and does not appear in Postiz. If tagging fails the reel stays published and the result says which products to tag in the Instagram app. Instagram allows at most 25 product-tagged posts per account per 24h.",
+    "instagram_publish_reel",
+    "Publish a Reel directly to Instagram (optionally with a custom cover image), then optionally tag products on it. product_ids can be omitted to post untagged and tag later with instagram_tag_existing_reel. Publishes IMMEDIATELY (no scheduling) and does not appear in Postiz. If tagging fails the reel stays published and the result says which products to tag. Instagram allows at most 25 product-tagged posts per account per 24h.",
     {
       account: accountParam,
       video_url: z.string().describe("Public .mp4 URL, e.g. a Postiz /uploads/ path from postiz_upload_from_url"),
       caption: z.string().max(2200).describe("Plain-text caption (not HTML)"),
-      product_ids: z.array(z.string()).min(1).max(5).describe("product_id values from instagram_search_products"),
+      product_ids: z.array(z.string()).max(5).default([]).describe("Optional product_id values from instagram_search_products; omit to publish untagged"),
       cover_url: z.string().optional().describe("Public JPG/PNG cover image URL, ideally 1080x1920"),
       share_to_feed: z.boolean().default(true),
     },
-    async ({ account, video_url, caption, product_ids, cover_url, share_to_feed = true }) => {
+    async ({ account, video_url, caption, product_ids = [], cover_url, share_to_feed = true }) => {
       try {
         const { ig_user_id } = getIgAccount(account);
         const container = await graph("POST", `/${ig_user_id}/media`, {
@@ -289,6 +289,16 @@ function buildMcpServer() {
         await waitForContainer(container.id);
         const published = await graph("POST", `/${ig_user_id}/media_publish`, { creation_id: container.id });
         const media = await graph("GET", `/${published.id}`, { fields: "permalink" });
+        if (product_ids.length === 0) {
+          return jsonResult({
+            success: true,
+            account,
+            media_id: published.id,
+            permalink: media.permalink,
+            tags: [],
+            next_step: "Published untagged. Tag it with instagram_tag_existing_reel using this media_id.",
+          });
+        }
         try {
           const tags = await tagPublishedMedia(published.id, product_ids);
           return jsonResult({ success: true, account, media_id: published.id, permalink: media.permalink, tags });
